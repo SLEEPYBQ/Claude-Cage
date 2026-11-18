@@ -3,12 +3,13 @@
 package workbench
 
 import (
-	"context"
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -29,6 +30,9 @@ func TestProjectShareReuseWithStalledGuestRead(t *testing.T) {
 		t.Skip("sleep unavailable")
 	}
 	s, folder, _ := groupFixture(t)
+	if err := s.rememberSharedProject(folder); err != nil {
+		t.Fatal(err)
+	}
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -44,11 +48,8 @@ func TestProjectShareReuseWithStalledGuestRead(t *testing.T) {
 	}
 	config := &ssh.ServerConfig{NoClientAuth: true}
 	config.AddHostKey(signer)
-	marker := "cage-test-read-probe"
-	if err := os.WriteFile(filepath.Join(folder, marker), []byte("readable on host"), 0600); err != nil {
-		t.Fatal(err)
-	}
-	var reads, preparations atomic.Int32
+	var reads, handoffs atomic.Int32
+	var recovered atomic.Bool
 	go func() {
 		for {
 			conn, err := listener.Accept()
@@ -57,7 +58,7 @@ func TestProjectShareReuseWithStalledGuestRead(t *testing.T) {
 			}
 			func() {
 				defer conn.Close()
-				_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+				_ = conn.SetDeadline(time.Now().Add(12 * time.Second))
 				server, channels, requests, err := ssh.NewServerConn(conn, config)
 				if err != nil {
 					return
@@ -78,15 +79,23 @@ func TestProjectShareReuseWithStalledGuestRead(t *testing.T) {
 						_ = request.Reply(true, nil)
 						status := uint32(0)
 						switch {
-						case strings.Contains(payload.Command, marker):
-							// Accept the SSH command but never complete the requested directory read.
+						case strings.Contains(payload.Command, "mountpoint -q --") && strings.Contains(payload.Command, "os.scandir"):
 							reads.Add(1)
-							continue
-						case strings.Contains(payload.Command, "mountpoint"):
-							preparations.Add(1)
-							status = 1
+							if !recovered.Load() {
+								// Keep SSH established while the guest directory read stalls.
+								continue
+							}
+						case strings.Contains(payload.Command, "--unix-socket /run/cage-desktop/files.sock"):
+							handoffs.Add(1)
+							body, err := io.ReadAll(channel)
+							var input map[string]string
+							if err != nil || json.Unmarshal(body, &input) != nil || input["path"] != guestPath(folder) || input["id"] != testBrowserFileID {
+								status = 1
+							} else {
+								_, _ = channel.Write([]byte("{\"ok\":true}\nCAGE_FILE_HTTP:200"))
+							}
 						default:
-							_, _ = channel.Write([]byte("guest control responsive"))
+							status = 1
 						}
 						_, _ = channel.SendRequest("exit-status", false, ssh.Marshal(struct{ Status uint32 }{status}))
 						_ = channel.Close()
@@ -111,44 +120,33 @@ func TestProjectShareReuseWithStalledGuestRead(t *testing.T) {
 	t.Cleanup(share.close)
 	s.projectShares[folder] = share
 
-	checkCtx, cancelCheck := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancelCheck()
-	if out, err := s.guest(checkCtx, "printf 'guest control responsive'"); err != nil || string(out) != "guest control responsive" {
-		t.Fatalf("guest control response %q, error %v", out, err)
+	body, err := json.Marshal(map[string]string{"target": "desktop", "id": testBrowserFileID, "workspace": folder})
+	if err != nil {
+		t.Fatal(err)
 	}
-	readCtx, cancelRead := context.WithTimeout(context.Background(), time.Second)
-	defer cancelRead()
-	_, readErr := s.guest(readCtx, "cat '"+guestPath(filepath.Join(folder, marker))+"'")
-	if readErr == nil || readCtx.Err() != context.DeadlineExceeded || reads.Load() != 1 {
-		t.Fatalf("expected one stalled guest read, got %d reads, command error %v, context error %v", reads.Load(), readErr, readCtx.Err())
+	const endpoint = "/api/input/files/directory"
+	started := time.Now()
+	resp := request(s, "POST", endpoint, s.origin, string(body), true)
+	if elapsed := time.Since(started); elapsed >= 8*time.Second {
+		t.Fatalf("handoff returned after %s, expected the short probe deadline", elapsed)
 	}
-	t.Log("SSH control responded normally, but the simulated project-file read timed out")
-
+	if resp.Code != http.StatusBadRequest || !strings.Contains(resp.Body.String(), "项目文件夹暂时无法读取") || reads.Load() != 1 || handoffs.Load() != 0 {
+		t.Fatalf("stalled read: HTTP %d (%s), reads %d, handoffs %d", resp.Code, resp.Body.String(), reads.Load(), handoffs.Load())
+	}
 	select {
 	case <-share.done:
-		t.Fatal("share transport exited before project submission")
+		t.Fatal("failed check closed the in-use transport")
 	default:
 	}
-	save, _ := json.Marshal(projectGroup{Name: "test project", Folders: []string{folder}})
-	open, _ := json.Marshal(map[string]string{"workspace": folder})
-	for _, tc := range []struct {
-		path string
-		body []byte
-	}{
-		{"/api/projects/save", save},
-		{"/api/projects/open", open},
-	} {
-		resp := request(s, "POST", tc.path, s.origin, string(tc.body), true)
-		if resp.Code != 200 || preparations.Load() != 0 || reads.Load() != 1 {
-			t.Fatalf("%s returned HTTP %d (%s), preparation commands %d, reads %d", tc.path, resp.Code, resp.Body.String(), preparations.Load(), reads.Load())
-		}
-		t.Logf("%s returned HTTP %d with zero guest reads or mount checks during submission", tc.path, resp.Code)
+	if s.projectShares[folder] != share {
+		t.Fatal("failed check replaced the existing share")
 	}
+	t.Log("stalled directory check returned an error before handoff and preserved the existing transport")
 
-	share.close()
-	resp := request(s, "POST", "/api/projects/open", s.origin, string(open), true)
-	if resp.Code != 400 || !strings.Contains(resp.Body.String(), "无法在 Cage 中准备项目目录") || preparations.Load() != 1 {
-		t.Fatalf("stopped transport probe returned HTTP %d (%s), preparation commands %d", resp.Code, resp.Body.String(), preparations.Load())
+	recovered.Store(true)
+	resp = request(s, "POST", endpoint, s.origin, string(body), true)
+	if resp.Code != http.StatusOK || strings.TrimSpace(resp.Body.String()) != `{"ok":true}` || reads.Load() != 2 || handoffs.Load() != 1 {
+		t.Fatalf("recovered read: HTTP %d (%s), reads %d, handoffs %d", resp.Code, resp.Body.String(), reads.Load(), handoffs.Load())
 	}
-	t.Logf("after transport exit, project open attempted mount preparation and returned HTTP %d (%s)", resp.Code, strings.TrimSpace(resp.Body.String()))
+	t.Log("retry after the directory recovered delivered it through the guest file service")
 }

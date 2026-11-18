@@ -219,6 +219,27 @@ func (s *Server) fileTargetReady(target, id string) bool {
 	return target == "browser" || target == "desktop"
 }
 
+func (s *Server) checkLinuxProjectDirectory(ctx context.Context, path string) error {
+	asWorkUser, err := s.linuxTemplate("sudo -H -u cage ")
+	if err != nil {
+		return err
+	}
+	// An SSHFS transport can outlive usable directory I/O. Check the mount
+	// and read an entry, since cached attributes can survive a stalled share.
+	const readDirectory = `import os, sys
+with os.scandir(sys.argv[1]) as entries:
+    next(entries, None)
+`
+	check := "mountpoint -q -- " + shellescape.Quote(path) + " && exec " + asWorkUser +
+		shellescape.QuoteCommand([]string{"/usr/bin/python3", "-I", "-c", readDirectory, path})
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	if _, err := s.guest(ctx, "exec /usr/bin/timeout --kill-after=1s 3s /bin/bash -c "+shellescape.Quote(check)); err != nil {
+		return errors.New("项目文件夹暂时无法读取，请检查共享连接后重试。持续失败时，请保存工作后重启环境")
+	}
+	return nil
+}
+
 func (s *Server) fileInputAction(w http.ResponseWriter, r *http.Request) {
 	var input struct {
 		Target    string  `json:"target"`
@@ -289,7 +310,14 @@ func (s *Server) fileInputAction(w http.ResponseWriter, r *http.Request) {
 			requestError(w, err)
 			return
 		}
-		body, _ = json.Marshal(map[string]string{"id": input.ID, "path": guestPath(workspace)})
+		path := guestPath(workspace)
+		if s.macosGuest == nil && s.windowsGuest == nil && workspace != s.environmentDir() && !isClientMountPath(workspace) {
+			if err := s.checkLinuxProjectDirectory(ctx, path); err != nil {
+				requestError(w, err)
+				return
+			}
+		}
+		body, _ = json.Marshal(map[string]string{"id": input.ID, "path": path})
 		if s.macosGuest != nil {
 			body, _ = json.Marshal(map[string]string{"id": input.ID, "path": macOSProjectPath(s.macosGuest.User, workspace)})
 		} else if s.windowsGuest != nil {
